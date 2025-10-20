@@ -62,6 +62,7 @@ This script will:
 
 ### 3. API Setup
 
+
 ```bash
 # Install Python dependencies
 pip install -r requirements.txt
@@ -75,6 +76,7 @@ python main.py
 # or
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
+The setup script automatically installs Python packages and starts the FastAPI server. No additional steps needed!
 
 ## 📚 API Endpoints
 
