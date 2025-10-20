@@ -203,7 +203,16 @@ main() {
     echo "  User: $DB_USER"
     echo "  Password: $DB_PASSWORD"
     
-    print_status "You can now use your routing API with these connection details"
+ # Step 10: Install Python packages
+    print_status "Installing Python packages..."
+    sudo apt install python3-fastapi python3-uvicorn python3-psycopg2 python3-dotenv -y
+    print_success "Python packages installed"
+    
+    # Step 11: Start the FastAPI server
+    print_status "Starting FastAPI server..."
+    
+    # Start the server
+    python3 main.py
 }
 
 # Error handling
