@@ -21,6 +21,8 @@ class RouteFromBatchResponse(BaseModel):
     total_stops: int
     route_geojson: dict
     stops: list[dict]
+    total_time_min: float | None = None
+    segment_count: int | None = None
 
 def get_connection():
     return psycopg2.connect(
@@ -66,39 +68,189 @@ def create_multi_stop_route(geocode_results: list[dict]) -> dict:
         query = f"""
         {stops_cte}
         snap AS (
-          SELECT id, (
-            SELECT id FROM ways_vertices_pgr
-            ORDER BY the_geom <-> stops.geom
-            LIMIT 1
-          ) AS vertex_id
-          FROM stops
+          SELECT 
+            s.id,
+            s.geom,
+            COALESCE(
+              -- Try to find closest road segment with direction-aware snapping
+              (
+                SELECT 
+                  CASE 
+                    -- For first stop, use closest vertex
+                    WHEN s.id = 1 THEN
+                      CASE 
+                        WHEN ST_Distance(ST_StartPoint(w.the_geom)::geography, s.geom::geography) < 
+                             ST_Distance(ST_EndPoint(w.the_geom)::geography, s.geom::geography)
+                        THEN w.source
+                        ELSE w.target
+                      END
+                    -- For last stop, use closest vertex
+                    WHEN s.id = (SELECT MAX(id) FROM stops) THEN
+                      CASE 
+                        WHEN ST_Distance(ST_StartPoint(w.the_geom)::geography, s.geom::geography) < 
+                             ST_Distance(ST_EndPoint(w.the_geom)::geography, s.geom::geography)
+                        THEN w.source
+                        ELSE w.target
+                      END
+                    -- For intermediate stops, prefer vertex that allows forward travel toward next stop
+                    ELSE
+                      CASE 
+                        -- Check if there's a next stop to determine direction
+                        WHEN EXISTS (SELECT 1 FROM stops WHERE id = s.id + 1) THEN
+                          -- Use the vertex that's on the side going toward next stop
+                          CASE 
+                            -- If road goes toward next stop (within 90 degrees), use target vertex
+                            WHEN EXISTS (
+                              SELECT 1 FROM stops s2 
+                              WHERE s2.id = s.id + 1
+                              AND ABS(
+                                CASE 
+                                  WHEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) > pi() 
+                                  THEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) - 2*pi()
+                                  WHEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) < -pi() 
+                                  THEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) + 2*pi()
+                                  ELSE ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom)
+                                END
+                              ) < pi()/2
+                            ) THEN w.target  -- Road goes forward, use target
+                            ELSE w.source  -- Road goes backward or perpendicular, use source
+                          END
+                        -- Default: closest vertex
+                        ELSE
+                          CASE 
+                            WHEN ST_Distance(ST_StartPoint(w.the_geom)::geography, s.geom::geography) < 
+                                 ST_Distance(ST_EndPoint(w.the_geom)::geography, s.geom::geography)
+                            THEN w.source
+                            ELSE w.target
+                          END
+                      END
+                  END
+                FROM ways w
+                WHERE ST_DWithin(w.the_geom::geography, s.geom::geography, 150)
+                  -- Filter oneway roads: for non-first stops, ensure oneways go in correct direction
+                  AND (
+                    s.id = 1  -- First stop can use any road
+                    OR w.oneway IS NULL 
+                    OR w.oneway = '' 
+                    OR UPPER(TRIM(w.oneway)) = 'NO'
+                    OR UPPER(TRIM(w.oneway)) = 'UNKNOWN'
+                    -- For oneway='YES', check if it goes toward next stop
+                    OR (
+                      UPPER(TRIM(w.oneway)) = 'YES' 
+                      AND s.id < (SELECT MAX(id) FROM stops)
+                      -- Check if road direction aligns with travel direction to next stop
+                      AND EXISTS (
+                        SELECT 1 FROM stops s2 
+                        WHERE s2.id = s.id + 1
+                        AND (
+                          -- Calculate angle difference (handle circular angles)
+                          ABS(
+                            CASE 
+                              WHEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) > pi() 
+                              THEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) - 2*pi()
+                              WHEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) < -pi() 
+                              THEN ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom) + 2*pi()
+                              ELSE ST_Azimuth(ST_StartPoint(w.the_geom), ST_EndPoint(w.the_geom)) - ST_Azimuth(s.geom, s2.geom)
+                            END
+                          ) < pi()/2  -- Road goes within 90 degrees of travel direction
+                        )
+                      )
+                    )
+                  )
+                ORDER BY ST_Distance(w.the_geom::geography, s.geom::geography)
+                LIMIT 1
+              ),
+              -- Fallback to nearest vertex if no nearby road found
+              (
+                SELECT v.id
+                FROM ways_vertices_pgr v
+                ORDER BY v.the_geom <-> s.geom
+                LIMIT 1
+              )
+            ) AS vertex_id
+          FROM stops s
         ),
         pairs AS (
-          SELECT a.id AS from_id, a.vertex_id AS source,
-                 b.id AS to_id,   b.vertex_id AS target
+          SELECT 
+            a.id AS from_id, 
+            a.vertex_id AS source,
+            b.id AS to_id, 
+            b.vertex_id AS target
           FROM snap a
           JOIN snap b ON b.id = a.id + 1
+          WHERE a.vertex_id IS NOT NULL 
+            AND b.vertex_id IS NOT NULL
+            AND a.vertex_id != b.vertex_id  -- Don't route to same vertex
         ),
         route_parts AS (
-          SELECT p.from_id, p.to_id, r.seq, r.node, r.edge, w.the_geom
-          FROM pairs p,
-               pgr_astar(
-                 'SELECT gid AS id, source, target,
-                         cost_time AS cost,
-                         reverse_cost_time AS reverse_cost,
-                         x1, y1, x2, y2
-                  FROM ways
-                  WHERE true',
-                 p.source, p.target,
-                 directed := true
-               ) AS r
+          SELECT 
+            p.from_id, 
+            p.to_id, 
+            r.seq, 
+            r.node, 
+            r.edge, 
+            w.the_geom,
+            w.cost_time,
+            w.name
+          FROM pairs p
+          CROSS JOIN LATERAL pgr_astar(
+            'SELECT gid AS id, 
+                    source, 
+                    target,
+                    CASE 
+                      -- Heavy penalty for wrong-way on reverse oneway (REVERSED means oneway in reverse direction)
+                      WHEN UPPER(TRIM(oneway)) = ''REVERSED'' THEN cost_time * 10000
+                      -- Prefer highways/motorways by reducing their cost (they are faster)
+                      -- Highway 401 has tag_id 101, other highways have 104, 106, etc.
+                      -- Also check for high speed roads (highways typically > 80 km/h)
+                      WHEN tag_id IN (101, 102, 103, 104, 106) OR (priority >= 1.0 AND maxspeed_forward > 80) THEN 
+                        cost_time * 0.6  -- 40% cost reduction for highways (strong preference)
+                      -- Prefer higher speed roads (secondary highways, major roads)
+                      WHEN maxspeed_forward > 80 THEN 
+                        cost_time * 0.75  -- 25% cost reduction for fast roads
+                      WHEN priority >= 1.0 THEN 
+                        cost_time * 0.85  -- 15% cost reduction for priority roads
+                      -- Normal forward cost
+                      ELSE cost_time
+                    END AS cost,
+                    CASE 
+                      -- Impossible to go backwards on one-way (YES means oneway in forward direction)
+                      WHEN UPPER(TRIM(oneway)) = ''YES'' THEN -1
+                      -- Heavy penalty for wrong-way on reverse oneway (going backwards on REVERSED)
+                      WHEN UPPER(TRIM(oneway)) = ''REVERSED'' THEN -1  -- Can''t go backwards on reverse oneway
+                      -- Prefer highways in reverse direction too (but only if not oneway)
+                      WHEN UPPER(TRIM(oneway)) != ''YES'' 
+                        AND (tag_id IN (101, 102, 103, 104, 106) OR (priority >= 1.0 AND maxspeed_forward > 80)) THEN 
+                        reverse_cost_time * 0.6  -- 40% cost reduction for highways
+                      WHEN UPPER(TRIM(oneway)) != ''YES'' AND maxspeed_forward > 80 THEN 
+                        reverse_cost_time * 0.75  -- 25% cost reduction for fast roads
+                      WHEN UPPER(TRIM(oneway)) != ''YES'' AND priority >= 1.0 THEN 
+                        reverse_cost_time * 0.85  -- 15% cost reduction for priority roads
+                      -- Normal reverse cost
+                      ELSE reverse_cost_time
+                    END AS reverse_cost,
+                    x1, y1, x2, y2
+             FROM ways
+             WHERE true',
+            p.source, 
+            p.target,
+            directed := true
+          ) AS r
           LEFT JOIN ways w ON r.edge = w.gid
+          WHERE r.edge > 0  -- Exclude start/end nodes
         ),
         full_route AS (
-          SELECT ST_LineMerge(ST_Collect(the_geom))::geometry(MultiLineString,4326) AS geom
+          SELECT 
+            ST_LineMerge(ST_Collect(the_geom ORDER BY from_id, seq))::geometry(MultiLineString,4326) AS geom,
+            SUM(cost_time) AS total_time_min,
+            COUNT(DISTINCT from_id) AS segment_count
           FROM route_parts
         )
-        SELECT ST_AsGeoJSON(geom) AS route_geojson FROM full_route;
+        SELECT 
+          ST_AsGeoJSON(geom) AS route_geojson,
+          total_time_min,
+          segment_count
+        FROM full_route;
         """
         
         conn = get_connection()
@@ -125,7 +277,9 @@ def create_multi_stop_route(geocode_results: list[dict]) -> dict:
                 "success": True,
                 "route_geojson": json.loads(result[0]),
                 "total_stops": len(successful_stops),
-                "stops": stop_details
+                "stops": stop_details,
+                "total_time_min": float(result[1]) if result[1] is not None else None,
+                "segment_count": int(result[2]) if result[2] is not None else None
             }
         else:
             return {
